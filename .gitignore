@@ -1,0 +1,4 @@
+.mimosa/
+.target/
+Cargo.lock
+*.log
