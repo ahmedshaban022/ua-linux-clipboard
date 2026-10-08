@@ -11,6 +11,29 @@ pub enum EntryKind {
     Uris,
 }
 
+impl EntryKind {
+    /// Canonical storage/IPC string. Single source for both directions
+    /// (sqlite previously re-implemented this twice).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EntryKind::Text => "text",
+            EntryKind::RichText => "rich_text",
+            EntryKind::Image => "image",
+            EntryKind::Uris => "uris",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<EntryKind> {
+        match s {
+            "text" => Some(EntryKind::Text),
+            "rich_text" => Some(EntryKind::RichText),
+            "image" => Some(EntryKind::Image),
+            "uris" => Some(EntryKind::Uris),
+            _ => None,
+        }
+    }
+}
+
 /// One stored clipboard item. See GLOSSARY.md: "Entry".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
@@ -68,17 +91,21 @@ impl RawCapture {
             at_ms,
         }
     }
-}
 
-pub fn kind_of(c: &RawCapture) -> EntryKind {
-    if c.image.is_some() {
-        EntryKind::Image
-    } else if c.uris.is_some() {
-        EntryKind::Uris
-    } else if c.html.is_some() {
-        EntryKind::RichText
-    } else {
-        EntryKind::Text
+    pub fn kind(&self) -> EntryKind {
+        if self.image.is_some() {
+            EntryKind::Image
+        } else if self.uris.is_some() {
+            EntryKind::Uris
+        } else if self.html.is_some() {
+            EntryKind::RichText
+        } else {
+            EntryKind::Text
+        }
+    }
+
+    pub fn preview(&self) -> String {
+        preview_for(self)
     }
 }
 
@@ -106,8 +133,8 @@ pub fn strip_tags(html: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn preview_for(c: &RawCapture) -> String {
-    match kind_of(c) {
+fn preview_for(c: &RawCapture) -> String {
+    match c.kind() {
         EntryKind::Image => {
             let kb = c.image.as_ref().map(|v| v.len()).unwrap_or(0) as f64 / 1024.0;
             ellipsize(&format!("Image · {kb:.1} KB"), 120)
@@ -137,13 +164,26 @@ mod tests {
     #[test]
     fn kind_priority_is_image_uris_html_text() {
         let mut c = RawCapture::text(0, "hi");
-        assert_eq!(kind_of(&c), EntryKind::Text);
+        assert_eq!(c.kind(), EntryKind::Text);
         c.html = Some("<b>hi</b>".into());
-        assert_eq!(kind_of(&c), EntryKind::RichText);
+        assert_eq!(c.kind(), EntryKind::RichText);
         c.uris = Some(vec!["file:///x".into()]);
-        assert_eq!(kind_of(&c), EntryKind::Uris);
+        assert_eq!(c.kind(), EntryKind::Uris);
         c.image = Some(vec![1, 2, 3]);
-        assert_eq!(kind_of(&c), EntryKind::Image);
+        assert_eq!(c.kind(), EntryKind::Image);
+    }
+
+    #[test]
+    fn kind_str_round_trips() {
+        for k in [
+            EntryKind::Text,
+            EntryKind::RichText,
+            EntryKind::Image,
+            EntryKind::Uris,
+        ] {
+            assert_eq!(EntryKind::parse(k.as_str()), Some(k));
+        }
+        assert_eq!(EntryKind::parse("nope"), None);
     }
 
     #[test]
@@ -165,13 +205,13 @@ mod tests {
     #[test]
     fn previews_per_kind() {
         let mut c = RawCapture::text(0, "plain text");
-        assert_eq!(preview_for(&c), "plain text");
+        assert_eq!(c.preview(), "plain text");
         c.html = Some("<p>rich &amp; bold</p>".into());
-        assert!(preview_for(&c).contains("rich"));
+        assert!(c.preview().contains("rich"));
         c.uris = Some(vec!["file:///a".into(), "file:///b".into()]);
-        assert!(preview_for(&c).starts_with("2 links"));
+        assert!(c.preview().starts_with("2 links"));
         c.uris = None;
         c.image = Some(vec![0u8; 2048]);
-        assert_eq!(preview_for(&c), "Image · 2.0 KB");
+        assert_eq!(c.preview(), "Image · 2.0 KB");
     }
 }

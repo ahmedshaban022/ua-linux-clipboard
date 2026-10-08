@@ -1,7 +1,7 @@
 //! `ua-clipboard` — control the daemon, run first-run setup, diagnose.
 //!
 //! Subcommands: ping · list [QUERY] · pin ID · unpin ID · delete ID ·
-//! clear · settings · set KEY VALUE · toggle · setup · doctor
+//! clear · settings · set KEY VALUE · toggle · setup · doctor · uninstall
 //!
 //! Non-Linux hosts: the CLI explains it needs Linux (dev convenience only).
 
@@ -21,6 +21,7 @@ fn main() {
         "toggle" => cmd_toggle(),
         "setup" => cmd_setup(),
         "doctor" => cmd_doctor(),
+        "uninstall" => cmd_uninstall(rest.iter().any(|a| a == "--purge")),
         _ => {
             print_help();
             0
@@ -41,9 +42,10 @@ Usage: ua-clipboard <COMMAND>
   delete ID         delete an entry     clear      delete all unpinned
   settings          show settings       set K V    change one (shortcut,
                                                     max_entries, max_image_mb, autostart)
-  toggle            ask the daemon to toggle the panel
-  setup             first-run: autostart + Super+V registration per desktop
-  doctor            diagnose the setup (watching, shortcut, daemon, IPC)"
+  toggle            present the panel (what Super+V runs)
+  setup             first-run: daemon, autostart + Super+V per desktop
+  doctor            diagnose the setup (watching, shortcut, daemon, IPC)
+  uninstall [--purge]  remove registrations; --purge also deletes history"
     );
 }
 
@@ -52,35 +54,10 @@ use ua_core::ipc::{Request, Response};
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
     use std::process::Command;
 
-    use ua_core::ipc::{Request, Response};
-
-    pub fn socket_path() -> String {
-        std::env::var("UA_CLIPBOARD_SOCKET").unwrap_or_else(|_| {
-            let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-            format!("{runtime}/ua-clipboard.sock")
-        })
-    }
-
-    pub fn request(req: &Request) -> Result<Response, String> {
-        let path = socket_path();
-        let mut stream = UnixStream::connect(&path).map_err(|e| format!("connect {path}: {e}"))?;
-        let json = serde_json::to_string(req).map_err(|e| e.to_string())?;
-        writeln!(stream, "{json}").map_err(|e| e.to_string())?;
-        stream.flush().ok();
-        let mut line = String::new();
-        let mut reader = BufReader::new(stream);
-        reader.read_line(&mut line).map_err(|e| e.to_string())?;
-        serde_json::from_str(line.trim()).map_err(|e| e.to_string())
-    }
-
-    pub fn autostart_dir() -> String {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        format!("{home}/.config/autostart")
-    }
+    pub use ua_ipc::request;
+    pub use ua_ipc::socket_path;
 
     pub fn run(cmd: &str, args: &[&str]) -> Option<String> {
         Command::new(cmd)
@@ -91,6 +68,16 @@ mod platform {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
     }
 
+    pub fn spawn_detached(cmd: &str, args: &[&str]) -> bool {
+        Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+
     pub fn desktop() -> String {
         std::env::var("XDG_CURRENT_DESKTOP")
             .unwrap_or_default()
@@ -99,6 +86,16 @@ mod platform {
 
     pub fn session_type() -> String {
         std::env::var("XDG_SESSION_TYPE").unwrap_or_default()
+    }
+
+    pub fn autostart_dir() -> String {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        format!("{home}/.config/autostart")
+    }
+
+    pub fn state_dir() -> String {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        format!("{home}/.local/state/ua-clipboard")
     }
 
     /// GNOME: register a custom keybinding via gsettings (ticket 02).
@@ -137,11 +134,50 @@ mod platform {
         Ok(())
     }
 
+    /// Unregister our GNOME keybinding entry if present.
+    pub fn unregister_gnome_shortcut() -> Result<(), String> {
+        let sda = "org.gnome.settings-daemon.plugins.media-keys";
+        let existing =
+            run("gsettings", &[sda, "get", "custom-keybindings"]).unwrap_or_else(|| "[]".into());
+        if !existing.contains("ua-clipboard") {
+            return Ok(());
+        }
+        // Parse the printed array crudely: keep every quoted path but ours.
+        let kept: Vec<&str> = existing
+            .split(['[', ']', ','])
+            .map(|p| p.trim().trim_matches(['\'', '"']))
+            .filter(|p| p.starts_with('/') && !p.contains("ua-clipboard"))
+            .collect();
+        let merged = if kept.is_empty() {
+            "[]".to_string()
+        } else {
+            let inner: Vec<String> = kept.iter().map(|p| format!("'{p}'")).collect();
+            format!("[{}]", inner.join(", "))
+        };
+        run("gsettings", &["set", sda, "custom-keybindings", &merged])
+            .ok_or("gsettings set custom-keybindings failed")?;
+        Ok(())
+    }
+
+    pub fn gnome_shortcut_registered() -> bool {
+        run(
+            "gsettings",
+            &[
+                "get",
+                "org.gnome.settings-daemon.plugins.media-keys",
+                "custom-keybindings",
+            ],
+        )
+        .map(|v| v.contains("ua-clipboard"))
+        .unwrap_or(false)
+    }
+
     pub fn write_autostart() -> Result<String, String> {
         let dir = autostart_dir();
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = format!("{dir}/ua-clipboard.desktop");
-        let bin = which_daemon_bin();
+        let bin =
+            run("which", &["ua-clipboard-daemon"]).unwrap_or_else(|| "ua-clipboard-daemon".into());
         let content = format!(
             "[Desktop Entry]\nType=Application\nName=UA Clipboard\nExec={bin}\nX-GNOME-Autostart-enabled=true\nComment=Windows 11-style clipboard history\n"
         );
@@ -149,18 +185,14 @@ mod platform {
         Ok(path)
     }
 
-    fn which_daemon_bin() -> String {
-        run("which", &["ua-clipboard-daemon"]).unwrap_or_else(|| "ua-clipboard-daemon".into())
-    }
-
     pub fn print_wlroots_snippet(accel: &str) {
         let key = accel.trim_start_matches(['<', '>']).to_lowercase();
         println!("\nAdd to your compositor config:\n");
-        println!("  sway:   bindsym {key} exec ua-clipboard-panel");
-        println!("  hypr:   bind = SUPER, V, exec, ua-clipboard-panel");
+        println!("  sway:   bindsym {key} exec ua-clipboard toggle");
+        println!("  hypr:   bind = SUPER, V, exec, ua-clipboard toggle");
         println!("         (and enable the data-control/clipboard plugin for watching — see Hyprland wiki)");
         println!(
-            "  (KDE Plasma 6: Settings → Shortcuts → Custom → add '{accel}' → ua-clipboard-panel)"
+            "  (KDE Plasma 6: Settings → Shortcuts → Custom → add '{accel}' → ua-clipboard toggle)"
         );
     }
 }
@@ -192,9 +224,10 @@ fn cmd_ping() -> i32 {
 fn cmd_list(query: &str) -> i32 {
     match request(&Request::List {
         query: query.to_string(),
+        offset: 0,
     }) {
-        Ok(Response::Entries { items }) => {
-            for s in items {
+        Ok(Response::Entries { entries }) => {
+            for s in entries {
                 let pin = if s.pinned { "[pin] " } else { "" };
                 println!("{:>4}  {pin}{}", s.id, s.preview);
             }
@@ -325,54 +358,89 @@ fn cmd_set(rest: &[String]) -> i32 {
     }
 }
 
+/// Spec §1: this is what Super+V runs. The daemon presents the
+/// single-instance panel; without a daemon we present it directly.
 #[cfg(target_os = "linux")]
 fn cmd_toggle() -> i32 {
     match request(&Request::Toggle) {
         Ok(Response::Ok) => 0,
-        _ => 1,
+        _ if spawn_detached("ua-clipboard-panel", &[]) => 0,
+        _ => {
+            println!("cannot present the panel (no daemon, no ua-clipboard-panel)");
+            1
+        }
     }
 }
 
+/// Spec §7 flow: detect DE → register Super+V → autostart → Hyprland
+/// data-control check → extension guidance (GNOME) → daemon running.
 #[cfg(target_os = "linux")]
 fn cmd_setup() -> i32 {
     println!("UA Clipboard setup\n");
     let desktop = desktop();
     let session = session_type();
 
-    match request(&Request::GetSettings) {
-        Ok(Response::Settings(s)) => {
-            println!("• settings ok (shortcut {})", s.shortcut);
-            if let Err(e) = register_desktop_shortcut(&s.shortcut, &desktop) {
-                println!("• shortcut: FAILED ({e}) — see doctor");
-            } else if desktop.contains("GNOME") {
-                println!("• shortcut: registered via gsettings (GNOME)");
-            }
-            match write_autostart() {
-                Ok(path) => println!("• autostart: {path}"),
-                Err(e) => println!("• autostart: FAILED ({e})"),
-            }
-            if !desktop.contains("GNOME") && session.contains("wayland") {
-                print_wlroots_snippet(&s.shortcut);
-            }
-            println!("\nNext: start the daemon (ua-clipboard-daemon) and open the panel (ua-clipboard-panel).");
-            0
+    // 1. Daemon up first so registration results are visible immediately.
+    if !matches!(request(&Request::Ping), Ok(Response::Pong)) {
+        if spawn_detached("ua-clipboard-daemon", &[]) {
+            println!("• daemon: started");
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        } else {
+            println!("• daemon: could not start ua-clipboard-daemon — is it installed?");
+            return 1;
         }
-        _ => {
-            println!("daemon not running — start ua-clipboard-daemon first");
-            1
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn register_desktop_shortcut(accel: &str, desktop: &str) -> Result<(), String> {
-    if desktop.contains("GNOME") {
-        register_gnome_shortcut(accel, "ua-clipboard-panel")
     } else {
-        // KDE: GlobalShortcuts portal flow is interactive; print guidance.
-        // wlroots: compositor config; snippet printed by caller.
-        Ok(())
+        println!("• daemon: already running");
     }
+
+    let shortcut = match request(&Request::GetSettings) {
+        Ok(Response::Settings(s)) => s.shortcut,
+        _ => "<Super>v".to_string(),
+    };
+
+    // 2. Shortcut per DE.
+    if desktop.contains("GNOME") {
+        match register_gnome_shortcut(&shortcut, "ua-clipboard toggle") {
+            Ok(()) => println!("• shortcut: {shortcut} registered via gsettings (GNOME)"),
+            Err(e) => println!("• shortcut: FAILED ({e}) — see doctor"),
+        }
+    } else if session.contains("wayland") {
+        // wlroots/KDE: portal or compositor config — print exact steps.
+        println!(
+            "• shortcut: register in your compositor/desktop settings → 'ua-clipboard toggle'"
+        );
+        print_wlroots_snippet(&shortcut);
+    } else {
+        // X11: the daemon's XGrabKey owns the shortcut — nothing to write.
+        println!("• shortcut: {shortcut} grabbed by the daemon (X11)");
+    }
+
+    // 3. Autostart.
+    match write_autostart() {
+        Ok(path) => println!("• autostart: {path}"),
+        Err(e) => println!("• autostart: FAILED ({e})"),
+    }
+
+    // 4. Hyprland data-control check (watching depends on it).
+    if desktop.contains("HYPRLAND") && session.contains("wayland") {
+        println!("• Hyprland: ensure the data-control/clipboard plugin is enabled, then restart the daemon");
+    }
+
+    // 5. Companion Extension guidance (GNOME Wayland — ADR-0001).
+    if desktop.contains("GNOME") && session.contains("wayland") {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let ext = format!("{home}/.local/share/gnome-shell/extensions/ua-clipboard@ua");
+        if std::path::Path::new(&ext).exists() {
+            println!("• companion extension: found");
+        } else {
+            println!("• companion extension: install with");
+            println!("    cp -r extension/ {ext}/");
+            println!("  then restart GNOME Shell and enable it (doctor verifies)");
+        }
+    }
+
+    println!("\nSetup complete — press {shortcut} or run: ua-clipboard toggle");
+    0
 }
 
 #[cfg(target_os = "linux")]
@@ -392,6 +460,25 @@ fn cmd_doctor() -> i32 {
         }
     }
 
+    // Watcher + counters from the daemon itself.
+    match request(&Request::Status) {
+        Ok(Response::Status {
+            backend,
+            captures,
+            secrets_skipped,
+            oversize_skipped,
+        }) => {
+            println!("• watcher backend: {backend}");
+            println!(
+                "• stats: {captures} captures, {secrets_skipped} secrets skipped, {oversize_skipped} oversize images skipped"
+            );
+            if backend == "gnome-extension" {
+                println!("  (GNOME: captures appear only with the Companion Extension installed)");
+            }
+        }
+        _ => println!("• status: unavailable (older daemon?)"),
+    }
+
     if session.contains("wayland") && !desktop.contains("GNOME") {
         match run("which", &["wl-paste"]) {
             Some(p) => println!("• wl-paste: {p}"),
@@ -405,11 +492,19 @@ fn cmd_doctor() -> i32 {
         }
     }
 
+    // Shortcut registration per DE.
+    if desktop.contains("GNOME") {
+        if gnome_shortcut_registered() {
+            println!("• shortcut: registered (gsettings)");
+        } else {
+            println!("• shortcut: NOT registered — run ua-clipboard setup");
+            bad += 1;
+        }
+    }
+
     if desktop.contains("GNOME") && session.contains("wayland") {
-        let ext_dir = format!(
-            "{}/.local/share/gnome-shell/extensions/ua-clipboard@ua",
-            std::env::var("HOME").unwrap_or_default()
-        );
+        let home = std::env::var("HOME").unwrap_or_default();
+        let ext_dir = format!("{home}/.local/share/gnome-shell/extensions/ua-clipboard@ua");
         if std::path::Path::new(&ext_dir).exists() {
             println!("• companion extension: found");
         } else {
@@ -429,6 +524,52 @@ fn cmd_doctor() -> i32 {
         0
     } else {
         println!("\n{bad} issue(s) found.");
+        1
+    }
+}
+
+/// Spec §7: uninstall reverses registrations; --purge also removes data.
+#[cfg(target_os = "linux")]
+fn cmd_uninstall(purge: bool) -> i32 {
+    println!("UA Clipboard uninstall\n");
+    let desktop = desktop();
+    let mut bad = 0;
+
+    if desktop.contains("GNOME") {
+        match unregister_gnome_shortcut() {
+            Ok(()) => println!("• shortcut: unregistered"),
+            Err(e) => {
+                println!("• shortcut: FAILED ({e})");
+                bad += 1;
+            }
+        }
+    } else {
+        println!("• shortcut: remove the bind you added for 'ua-clipboard toggle'");
+    }
+
+    let autostart = format!("{}/ua-clipboard.desktop", autostart_dir());
+    match std::fs::remove_file(&autostart) {
+        Ok(()) => println!("• autostart: removed ({autostart})"),
+        Err(_) => println!("• autostart: not present"),
+    }
+
+    let socket = socket_path();
+    let _ = std::fs::remove_file(&socket);
+    println!("• socket: cleaned ({socket})");
+
+    if purge {
+        let state = state_dir();
+        match std::fs::remove_dir_all(&state) {
+            Ok(()) => println!("• history + settings: DELETED ({state})"),
+            Err(_) => println!("• history: nothing to delete ({state})"),
+        }
+    } else {
+        println!("• history kept (use --purge to delete {})", state_dir());
+    }
+
+    if bad == 0 {
+        0
+    } else {
         1
     }
 }
@@ -474,5 +615,9 @@ fn cmd_setup() -> i32 {
 }
 #[cfg(not(target_os = "linux"))]
 fn cmd_doctor() -> i32 {
+    cmd_ping()
+}
+#[cfg(not(target_os = "linux"))]
+fn cmd_uninstall(_: bool) -> i32 {
     cmd_ping()
 }

@@ -1,14 +1,26 @@
 //! Storage abstraction. `ua-daemon` provides SQLite; tests use `MemoryStore`.
 
+use crate::ipc::EntrySummary;
 use crate::model::Entry;
 
 pub trait Store: Send {
     /// All entries, display order: pinned (by pin_order) first, then
     /// unpinned newest-first. The panel splits sections from the flag.
+    ///
+    /// Carries payloads — needed by the dedup policy. Clients that only
+    /// render the list should call [`Store::summaries`] instead so blobs
+    /// are never materialized (spec: panel opens < 150ms).
     fn list(&self) -> Vec<Entry>;
+    /// Payload-free listing for UI/IPC. Stores backed by SQL override this
+    /// to select metadata columns only; the default maps `list`.
+    fn summaries(&self) -> Vec<EntrySummary> {
+        self.list().iter().map(EntrySummary::from).collect()
+    }
     fn get(&self, id: u64) -> Option<Entry>;
     /// Insert a fully-formed entry, assigning its id. Returns the id.
     fn insert(&mut self, entry: Entry) -> u64;
+    /// Attach (or clear) a generated thumbnail after insert.
+    fn set_thumb(&mut self, id: u64, thumb: Option<Vec<u8>>);
     /// Move an existing entry to the top of recency (re-copy).
     fn bump(&mut self, id: u64, at_ms: u64);
     fn set_pinned(&mut self, id: u64, pinned: bool);
@@ -53,6 +65,12 @@ impl Store for MemoryStore {
         let id = entry.id;
         self.entries.push(entry);
         id
+    }
+
+    fn set_thumb(&mut self, id: u64, thumb: Option<Vec<u8>>) {
+        if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) {
+            e.thumb = thumb;
+        }
     }
 
     fn bump(&mut self, id: u64, at_ms: u64) {
@@ -139,5 +157,19 @@ mod tests {
         s.bump(1, 999);
         let ids: Vec<u64> = s.list().iter().map(|e| e.id).collect();
         assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn summaries_and_set_thumb() {
+        let mut s = MemoryStore::new();
+        let id = s.insert(entry(1, 100));
+        let sums = s.summaries();
+        assert_eq!(sums.len(), 1);
+        assert_eq!(sums[0].id, id);
+        assert_eq!(sums[0].size_bytes, 2); // "e1"
+        s.set_thumb(id, Some(vec![1, 2, 3]));
+        assert_eq!(s.get(id).unwrap().thumb, Some(vec![1, 2, 3]));
+        s.set_thumb(id, None);
+        assert_eq!(s.get(id).unwrap().thumb, None);
     }
 }

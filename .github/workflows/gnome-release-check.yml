@@ -1,0 +1,28 @@
+# ADR-0001 consequence: "version-pin metadata.json per GNOME minor, CI
+# check on new GNOME releases". This advisory job compares the newest
+# gnome-shell release against extension/metadata.json's shell-version list
+# and warns when the pins fall behind.
+name: gnome-release-check
+
+on:
+  schedule:
+    - cron: "0 6 1 * *" # monthly, 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare latest GNOME release with extension pins
+        run: |
+          LATEST=$(curl -fsSL https://gitlab.gnome.org/api/v4/projects/GNOME%2Fgnome-shell/repository/tags \
+            | grep -o '"name":"[0-9]*\.[0-9]*"' | head -1 | grep -o '[0-9]*\.[0-9]*' || true)
+          PINNED=$(grep -o '"[0-9]*"' extension/metadata.json | grep -o '[0-9]*' | sort -n | tail -1)
+          echo "latest GNOME: ${LATEST:-unknown}; highest pin: ${PINNED:-none}"
+          if [ -n "$LATEST" ] && [ -n "$PINNED" ]; then
+            MAJOR_L=${LATEST%%.*}; MAJOR_P=${PINNED%%.*}
+            if [ "$MAJOR_L" -gt "$MAJOR_P" ]; then
+              echo "::warning::GNOME $LATEST is out; extension pins stop at $PINNED. Test and extend shell-version (ADR-0001)."
+            fi
+          fi

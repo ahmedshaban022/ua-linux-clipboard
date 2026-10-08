@@ -26,3 +26,37 @@ jobs:
         run: cargo test --workspace
       - name: Release build
         run: cargo build --release --workspace
+
+  # Spec §8: X11 integration under Xvfb — copy via xclip, assert captured.
+  x11-integration:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libxcb1-dev \
+            xvfb xclip
+      - name: Build daemon and CLI
+        run: cargo build -p ua-daemon -p ua-cli
+      - name: Run daemon under Xvfb
+        run: |
+          export XDG_SESSION_TYPE=x11 DISPLAY=:99 XDG_RUNTIME_DIR=/tmp \
+            UA_CLIPBOARD_DB=/tmp/hist.db UA_CLIPBOARD_SOCKET=/tmp/ua.sock
+          Xvfb :99 &
+          sleep 2
+          ./target/debug/ua-clipboard-daemon &
+          sleep 2
+          ./target/debug/ua-clipboard ping
+      - name: Copy text and assert it is captured (XFixes → xclip path)
+        run: |
+          export DISPLAY=:99 UA_CLIPBOARD_SOCKET=/tmp/ua.sock
+          printf 'integration-canary' | xclip -selection clipboard -in
+          sleep 2
+          ./target/debug/ua-clipboard list | grep -q 'integration-canary'
+      - name: Relay capture and assert search finds it
+        run: |
+          export UA_CLIPBOARD_SOCKET=/tmp/ua.sock
+          echo 'relay-canary' | ./target/debug/ua-clipboard-daemon --capture-stdin
+          ./target/debug/ua-clipboard list relay | grep -q 'relay-canary'

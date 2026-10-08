@@ -11,8 +11,10 @@ path = "src/main.rs"
 
 [dependencies]
 ua-core = { path = "../ua-core" }
+ua-ipc = { path = "../ua-ipc" }
 serde_json = "1"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }

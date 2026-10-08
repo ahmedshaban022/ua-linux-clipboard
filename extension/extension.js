@@ -3,7 +3,8 @@
 // Why this exists (ADR-0001): Mutter implements neither wlr-data-control
 // nor ext-data-control, so a daemon cannot watch the clipboard on GNOME
 // Wayland. This extension is the watcher: it polls St.Clipboard, and pushes
-// every new text to the daemon over its Unix socket (JSON-line protocol).
+// every new text to the daemon over its Unix socket (JSON-line protocol,
+// same shape as ua-ipc in Rust).
 //
 // Next milestones (tracked in the README status table):
 //   1. Toggle the panel anchored near the focus on Super+V.
@@ -46,7 +47,17 @@ export default class UAClipboardExtension extends Extension {
         this._clipboard.get_text(St.ClipboardType.CLIPBOARD, (cb, text) => {
             if (text && text !== this._last) {
                 this._last = text;
-                this._push({ type: 'capture', offers: [], text: text, html: null, image_b64: null, uris: null, source_app: null });
+                this._push({
+                    type: 'capture',
+                    capture: {
+                        offers: [],
+                        text: text,
+                        html: null,
+                        image_b64: null,
+                        uris: null,
+                        source_app: null,
+                    },
+                });
             }
         });
     }

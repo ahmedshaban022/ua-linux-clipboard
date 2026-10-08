@@ -1,18 +1,35 @@
-//! Wire types for the daemon's JSON-line IPC (Unix socket now; DBus mirror
-//! per spec §2 later). Shared by ua-cli, ua-gtk and the GNOME extension.
+//! Wire types for the daemon's JSON-line IPC (Unix socket now; the DBus
+//! `org.ua.Clipboard` mirror rides on these same types — see README
+//! status table). Shared by ua-cli, ua-gtk, ua-ipc and the GNOME extension.
 
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Entry, EntryKind};
 use crate::settings::Settings;
 
+/// What a watcher/extension pushes for one clipboard change. Mirrors
+/// `RawCapture` minus the daemon-owned timestamp, with the image
+/// base64-encoded for the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapturePayload {
+    pub offers: Vec<String>,
+    pub text: Option<String>,
+    pub html: Option<String>,
+    /// Base64 PNG.
+    pub image_b64: Option<String>,
+    pub uris: Option<Vec<String>>,
+    pub source_app: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Ping,
-    /// Full list, optionally filtered by query (server-side search).
+    /// List summaries, newest first, optionally filtered by query
+    /// (server-side full-text search) and paged by offset.
     List {
         query: String,
+        offset: u32,
     },
     Get {
         id: u64,
@@ -21,7 +38,8 @@ pub enum Request {
     Select {
         id: u64,
     },
-    /// Select but paste the plain-text representation only.
+    /// Select but paste the plain-text representation only (panel context
+    /// menu, ticket 07).
     SelectPlainText {
         id: u64,
     },
@@ -42,14 +60,10 @@ pub enum Request {
     Toggle,
     /// A capture pushed by a watcher (the GNOME extension pushes here).
     Capture {
-        offers: Vec<String>,
-        text: Option<String>,
-        html: Option<String>,
-        /// Base64 PNG.
-        image_b64: Option<String>,
-        uris: Option<Vec<String>>,
-        source_app: Option<String>,
+        capture: CapturePayload,
     },
+    /// Health/diagnostics for `ua-clipboard doctor`.
+    Status,
 }
 
 /// List rows carry no payloads — the panel fetches blobs via `Get`.
@@ -85,10 +99,20 @@ impl From<&Entry> for EntrySummary {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Pong,
-    Entries { items: Vec<EntrySummary> },
-    Entry { entry: Option<Entry> },
+    Entries {
+        entries: Vec<EntrySummary>,
+    },
+    Entry {
+        entry: Option<Entry>,
+    },
     Ok,
     Settings(Settings),
+    Status {
+        backend: String,
+        captures: u64,
+        secrets_skipped: u64,
+        oversize_skipped: u64,
+    },
     Error(String),
 }
 
@@ -100,11 +124,30 @@ mod tests {
     fn round_trips_over_json() {
         let req = Request::List {
             query: "foo".into(),
+            offset: 0,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"type\":\"list\""));
         let back: Request = serde_json::from_str(&json).unwrap();
-        assert!(matches!(back, Request::List { query } if query == "foo"));
+        assert!(matches!(back, Request::List { query, offset: 0 } if query == "foo"));
+    }
+
+    #[test]
+    fn capture_payload_round_trips() {
+        let req = Request::Capture {
+            capture: CapturePayload {
+                offers: vec!["text/plain;charset=utf-8".into()],
+                text: Some("hi".into()),
+                html: None,
+                image_b64: None,
+                uris: None,
+                source_app: None,
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"capture\""));
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::Capture { .. }));
     }
 
     #[test]

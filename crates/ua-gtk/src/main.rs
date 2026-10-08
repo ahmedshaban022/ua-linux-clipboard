@@ -2,22 +2,37 @@
 //! user reacts to per ticket 09). Linux builds show the libadwaita window;
 //! other hosts print guidance so the crate still builds for development.
 //!
-//! Status: list + search + pick (Select request) + Esc-close are wired to
-//! the daemon over IPC. Pin/delete buttons, section styling, image cards
-//! and the full keyboard model land with the panel milestone.
+//! Single-instance: launching `ua-clipboard-panel` again presents the
+//! existing window (GTK application activation) — that's what makes the
+//! Super+V path (`ua-clipboard toggle` → daemon spawns this binary) feel
+//! like a toggle.
+//!
+//! Status: list, server-side full-text search (daemon filters, this side
+//! only highlights), pick (Select request), Esc-close, Ctrl+F search
+//! focus. Pin/delete buttons, section styling, image cards and the rest
+//! of the keyboard model land with the panel milestone.
 
 #[cfg(target_os = "linux")]
 fn main() {
     use gtk::prelude::*;
     use libadwaita as adw;
     use libadwaita::prelude::*;
-    use ua_core::ipc::{EntrySummary, Request, Response};
+    use ua_core::ipc::{Request, Response};
 
     const APP_ID: &str = "org.ua.Clipboard";
 
     let app = adw::Application::builder().application_id(APP_ID).build();
 
-    app.connect_activate(|app| {
+    // Single-instance state: second launch re-presents the same window.
+    let window_slot = std::rc::Rc::new(std::cell::RefCell::new(None::<adw::ApplicationWindow>));
+    let slot = window_slot.clone();
+
+    app.connect_activate(move |app| {
+        if let Some(existing) = slot.borrow().as_ref() {
+            existing.present();
+            return;
+        }
+
         let win = adw::ApplicationWindow::builder()
             .application(app)
             .title("UA Clipboard")
@@ -44,45 +59,50 @@ fn main() {
         box_.append(&scroll);
         win.set_content(Some(&box_));
 
-        let summaries: std::rc::Rc<std::cell::RefCell<Vec<EntrySummary>>> =
-            std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        // Ids of the rows currently displayed, parallel to row position —
+        // the activate handler maps row → id through this, no string
+        // smuggling through widget properties.
+        let displayed_ids = std::rc::Rc::new(std::cell::RefCell::new(Vec::<u64>::new()));
 
         let list_r = list.clone();
-        let summaries_r = summaries.clone();
-        let rebuild = move |query: String| {
-            let q = query.trim().to_lowercase();
-            let all = summaries_r.borrow().clone();
+        let ids_r = displayed_ids.clone();
+        let rebuild = move |query: &str| {
+            let mut ids = ids_r.borrow_mut();
+            ids.clear();
             while let Some(child) = list_r.first_child() {
                 list_r.remove(&child);
             }
-            for s in all
-                .iter()
-                .filter(|s| q.is_empty() || s.preview.to_lowercase().contains(&q))
-            {
-                let row = gtk::ListBoxRow::new();
-                let shown = if s.pinned {
-                    format!("📌 {}", s.preview)
-                } else {
-                    s.preview.clone()
-                };
-                let label = gtk::Label::new(Some(&shown));
-                label.set_halign(gtk::Align::Start);
-                label.set_ellipsize(gtk::pango::EllipsizeMode::End);
-                label.set_max_width_chars(44);
-                row.set_child(Some(&label));
-                row.set_tooltip_text(Some(&relative_time(s.copied_at)));
-                row.set_property("name", s.id.to_string());
-                list_r.append(&row);
+            let response = ua_ipc::request(&Request::List {
+                query: query.to_string(),
+                offset: 0,
+            });
+            if let Ok(Response::Entries { entries }) = response {
+                for s in entries {
+                    let row = gtk::ListBoxRow::new();
+                    let label = gtk::Label::new(None);
+                    label.set_markup(&preview_markup(&s.preview, query));
+                    label.set_halign(gtk::Align::Start);
+                    label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                    label.set_max_width_chars(44);
+                    row.set_child(Some(&label));
+                    row.set_tooltip_text(Some(&relative_time(s.copied_at)));
+                    ids.push(s.id);
+                    list_r.append(&row);
+                }
             }
         };
 
+        // Search re-queries the daemon: full-text, case-insensitive
+        // (server-side ua_core::search), this side only highlights.
         let rebuild_s = rebuild.clone();
-        search.connect_changed(move |s| rebuild_s(s.text().to_string()));
+        search.connect_changed(move |s| rebuild_s(s.text().as_str()));
 
+        let ids_a = displayed_ids.clone();
         list.connect_row_activated(move |_l, row| {
-            let name: String = row.property("name");
-            if let Ok(id) = name.parse::<u64>() {
-                let _ = ipc_request(&Request::Select { id });
+            let idx = row.index();
+            let id = ids_a.borrow().get(idx.max(0) as usize).copied();
+            if let Some(id) = id {
+                let _ = ua_ipc::request(&Request::Select { id });
             }
             if let Some(root) = row.root() {
                 if let Ok(w) = root.downcast::<gtk::Window>() {
@@ -91,20 +111,58 @@ fn main() {
             }
         });
 
-        // Initial load: pull the list, then render.
-        match ipc_request(&Request::List {
-            query: String::new(),
-        }) {
-            Ok(Response::Entries { items }) => *summaries.borrow_mut() = items,
-            Ok(Response::Error(e)) => eprintln!("daemon error: {e}"),
-            Ok(_) => {}
-            Err(e) => eprintln!("{e}"),
-        }
-        rebuild(String::new());
+        // Keyboard model (ticket 07 subset): Esc closes, Ctrl+F focuses
+        // the search field.
+        let key = gtk::EventControllerKey::new();
+        let search_k = search.clone();
+        let win_k = win.clone();
+        key.connect_key_pressed(move |_, keyval, _, state| {
+            let name = keyval.name().unwrap_or_default();
+            if name == "Escape" {
+                win_k.close();
+                return gtk::glib::Propagation::Stop;
+            }
+            if state.contains(gtk::gdk::ModifierType::CONTROL_MASK) && name == "f" {
+                search_k.grab_focus();
+                return gtk::glib::Propagation::Stop;
+            }
+            gtk::glib::Propagation::Proceed
+        });
+        win.add_controller(key);
+
+        *slot.borrow_mut() = Some(win.clone());
+        rebuild("");
         win.present();
     });
 
     app.run();
+}
+
+/// Pango markup for a preview card: escaped text with `<b>` around
+/// case-insensitive occurrences of the query (ua_core::search::highlight).
+#[cfg(target_os = "linux")]
+fn preview_markup(preview: &str, query: &str) -> String {
+    use ua_core::search::highlight;
+
+    let spans = highlight(preview, query);
+    let mut out = String::with_capacity(preview.len() + 16);
+    for span in spans {
+        let chunk = &preview[span.start..span.start + span.byte_len];
+        let escaped = escape_markup(chunk);
+        if span.matched {
+            out.push_str(&format!("<b>{escaped}</b>"));
+        } else {
+            out.push_str(&escaped);
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "linux")]
+fn escape_markup(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[cfg(target_os = "linux")]
@@ -118,26 +176,6 @@ fn relative_time(copied_at: u64) -> String {
         3600..=86399 => format!("{} h ago", s / 3600),
         _ => format!("{} d ago", s / 86400),
     }
-}
-
-#[cfg(target_os = "linux")]
-fn ipc_request(req: &ua_core::ipc::Request) -> Result<ua_core::ipc::Response, String> {
-    use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixStream;
-
-    let path = std::env::var("UA_CLIPBOARD_SOCKET").unwrap_or_else(|_| {
-        let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
-        format!("{runtime}/ua-clipboard.sock")
-    });
-    let mut stream = UnixStream::connect(&path)
-        .map_err(|e| format!("connect {path}: {e} — is ua-clipboard-daemon running?"))?;
-    let json = serde_json::to_string(req).map_err(|e| e.to_string())?;
-    writeln!(stream, "{json}").map_err(|e| e.to_string())?;
-    stream.flush().ok();
-    let mut line = String::new();
-    let mut reader = BufReader::new(stream);
-    reader.read_line(&mut line).map_err(|e| e.to_string())?;
-    serde_json::from_str(line.trim()).map_err(|e| e.to_string())
 }
 
 #[cfg(not(target_os = "linux"))]

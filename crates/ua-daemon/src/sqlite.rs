@@ -3,6 +3,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
+use ua_core::ipc::EntrySummary;
 use ua_core::model::{Entry, EntryKind};
 use ua_core::settings::Settings;
 use ua_core::store::Store;
@@ -67,12 +68,7 @@ impl SqliteStore {
         let uris_json: Option<String> = row.get("uris_json")?;
         Ok(Entry {
             id: row.get("id")?,
-            kind: match kind.as_str() {
-                "text" => EntryKind::Text,
-                "rich_text" => EntryKind::RichText,
-                "image" => EntryKind::Image,
-                _ => EntryKind::Uris,
-            },
+            kind: EntryKind::parse(&kind).unwrap_or(EntryKind::Text),
             text: row.get("text")?,
             html: row.get("html")?,
             image: row.get("image_blob")?,
@@ -85,6 +81,19 @@ impl SqliteStore {
             preview: row.get("preview")?,
         })
     }
+
+    fn row_to_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<EntrySummary> {
+        let kind: String = row.get("kind")?;
+        Ok(EntrySummary {
+            id: row.get("id")?,
+            kind: EntryKind::parse(&kind).unwrap_or(EntryKind::Text),
+            preview: row.get("preview")?,
+            pinned: row.get::<_, i64>("pinned")? != 0,
+            copied_at: row.get("copied_at")?,
+            source_app: row.get("source_app")?,
+            size_bytes: row.get::<_, i64>("size_bytes")? as u64,
+        })
+    }
 }
 
 const LIST_ORDER: &str = "ORDER BY pinned DESC, pin_order ASC, copied_at DESC, id DESC";
@@ -94,12 +103,7 @@ fn entry_params(e: &Entry, id: Option<u64>) -> Vec<Box<dyn rusqlite::types::ToSq
     if let Some(id) = id {
         v.push(Box::new(id as i64));
     }
-    v.push(Box::new(match e.kind {
-        EntryKind::Text => "text",
-        EntryKind::RichText => "rich_text",
-        EntryKind::Image => "image",
-        EntryKind::Uris => "uris",
-    }));
+    v.push(Box::new(e.kind.as_str()));
     v.push(Box::new(e.text.clone()));
     v.push(Box::new(e.html.clone()));
     v.push(Box::new(e.image.clone()));
@@ -131,6 +135,26 @@ impl Store for SqliteStore {
         }
     }
 
+    /// Metadata-only listing for UI/IPC: never materializes image blobs
+    /// (spec priority: panel opens < 150ms).
+    fn summaries(&self) -> Vec<EntrySummary> {
+        let sql = format!(
+            "SELECT id, kind, preview, pinned, copied_at, source_app,
+                    COALESCE(LENGTH(text),0) + COALESCE(LENGTH(html),0)
+                    + COALESCE(LENGTH(image_blob),0) AS size_bytes
+             FROM entries {LIST_ORDER}"
+        );
+        let mut stmt = match self.conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map([], SqliteStore::row_to_summary);
+        match rows {
+            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
     fn get(&self, id: u64) -> Option<Entry> {
         self.conn
             .query_row("SELECT * FROM entries WHERE id = ?1", [id as i64], |row| {
@@ -153,6 +177,13 @@ impl Store for SqliteStore {
                 0
             }
         }
+    }
+
+    fn set_thumb(&mut self, id: u64, thumb: Option<Vec<u8>>) {
+        let _ = self.conn.execute(
+            "UPDATE entries SET thumb_blob = ?1 WHERE id = ?2",
+            params![thumb, id as i64],
+        );
     }
 
     fn bump(&mut self, id: u64, at_ms: u64) {

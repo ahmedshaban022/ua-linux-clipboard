@@ -11,4 +11,5 @@ path = "src/main.rs"
 
 [dependencies]
 ua-core = { path = "../ua-core" }
+ua-ipc = { path = "../ua-ipc" }
 serde_json = "1"

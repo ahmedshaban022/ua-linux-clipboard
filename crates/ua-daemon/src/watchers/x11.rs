@@ -4,26 +4,34 @@
 //! (ubiquitous, battle-tested); the native convert_selection read is the
 //! next platform milestone tracked in the README status table. The event
 //! source itself is native x11rb — we never poll.
+//!
+//! This backend also owns the Super+V XGrabKey (spec §1 shortcut column
+//! for X11): grabbed with the NumLock/CapsLock/ScrollLock variants so the
+//! modifier state doesn't break it, and each press presents the panel.
 
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 
+use ua_core::accel::Accel;
 use ua_core::clock::{Clock as _, SystemClock};
 use ua_core::model::RawCapture;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xfixes::ConnectionExt as _;
-use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, WindowClass};
+use x11rb::protocol::xproto::{
+    ConnectionExt as _, CreateWindowAux, GrabMode, Keycode, ModMask, WindowClass,
+};
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
-pub fn watch(tx: Sender<RawCapture>) {
-    if let Err(e) = run(&tx) {
+pub fn watch(tx: Sender<RawCapture>, shortcut: &str) {
+    if let Err(e) = run(&tx, shortcut) {
         eprintln!("[daemon] x11 watcher stopped: {e}");
     }
 }
 
-fn run(tx: &Sender<RawCapture>) -> Result<(), Box<dyn std::error::Error>> {
+fn run(tx: &Sender<RawCapture>, shortcut: &str) -> Result<(), Box<dyn std::error::Error>> {
     let (conn, screen_nr) = RustConnection::connect(None)?;
     let screen = conn.setup().roots.get(screen_nr).ok_or("no screen")?;
 
@@ -50,21 +58,156 @@ fn run(tx: &Sender<RawCapture>) -> Result<(), Box<dyn std::error::Error>> {
         | x11rb::protocol::xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
         | x11rb::protocol::xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE;
     conn.xfixes_select_selection_input(win, clipboard, mask)?;
+
+    // Global shortcut: grab the configured accel on the root window.
+    grab_shortcut(&conn, screen.root, shortcut)?;
+
     conn.flush()?;
 
-    println!("[daemon] x11: watching CLIPBOARD via XFixes");
+    println!("[daemon] x11: watching CLIPBOARD via XFixes; shortcut grabbed");
+    let last_panel = AtomicU32::new(0);
+    let grabbed = shortcut_key(shortcut).map(|(_, _, keycode)| keycode);
     loop {
         let event = conn.wait_for_event()?;
-        if let Event::XfixesSelectionNotify(notify) = event {
-            if notify.selection == clipboard
-                && notify.subtype == x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER
-            {
-                if let Some(capture) = fetch_capture() {
-                    let _ = tx.send(capture);
+        match event {
+            Event::XfixesSelectionNotify(notify) => {
+                if notify.selection == clipboard
+                    && notify.subtype
+                        == x11rb::protocol::xfixes::SelectionEvent::SET_SELECTION_OWNER
+                {
+                    if let Some(capture) = fetch_capture() {
+                        let _ = tx.send(capture);
+                    }
                 }
+            }
+            Event::KeyPress(press)
+                if grabbed == Some(press.detail) && debounce_ok(&last_panel, press.time) =>
+            {
+                spawn_panel();
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parse the settings accelerator into (modifier bits, keysym, keycode).
+fn shortcut_key(shortcut: &str) -> Option<(ModMask, u32, Keycode)> {
+    let accel = Accel::parse(shortcut).or_else(|| Accel::parse("<Super>v"))?;
+    let mut mods = ModMask::default();
+    if accel.ctrl {
+        mods |= ModMask::CONTROL;
+    }
+    if accel.shift {
+        mods |= ModMask::SHIFT;
+    }
+    if accel.alt {
+        mods |= ModMask::M1;
+    }
+    if accel.super_key {
+        mods |= ModMask::M4;
+    }
+    let sym = keysym(&accel.key)?;
+    Some((mods, sym, 0))
+}
+
+fn keysym(key: &str) -> Option<u32> {
+    if key.len() == 1 {
+        let c = key.chars().next()?;
+        if c.is_ascii_alphanumeric() {
+            return Some(c.to_ascii_uppercase() as u32);
+        }
+        return None;
+    }
+    // F1 = 0xffbe … F12 = 0xffc9
+    if let Some(num) = key.strip_prefix('F') {
+        if let Ok(n) = num.parse::<u32>() {
+            if (1..=12).contains(&n) {
+                return Some(0xffbe + n - 1);
             }
         }
     }
+    None
+}
+
+/// Grab `shortcut` on the root window, once per NumLock/CapsLock/ScrollLock
+/// combination so the grab survives modifier state (the classic X11 gotcha,
+/// ticket 02).
+fn grab_shortcut(
+    conn: &RustConnection,
+    root: u32,
+    shortcut: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (base, sym, _) = match shortcut_key(shortcut) {
+        Some(triple) => triple,
+        None => {
+            eprintln!("[daemon] x11: shortcut '{shortcut}' not grabbable; global key disabled");
+            return Ok(());
+        }
+    };
+    let Some(keycode) = keycode_for_keysym(conn, sym) else {
+        eprintln!("[daemon] x11: no keycode for keysym {sym:#x}; global key disabled");
+        return Ok(());
+    };
+
+    let numlock = ModMask::M2;
+    let capslock = ModMask::LOCK;
+    let scrolllock = ModMask::M5;
+    let extras = [
+        ModMask::default(),
+        numlock,
+        capslock,
+        scrolllock,
+        numlock | capslock,
+        numlock | scrolllock,
+        capslock | scrolllock,
+        numlock | capslock | scrolllock,
+    ];
+    for extra in extras {
+        conn.grab_key(
+            false,
+            root,
+            base | extra,
+            keycode,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+        )?;
+    }
+    Ok(())
+}
+
+fn keycode_for_keysym(conn: &RustConnection, sym: u32) -> Option<Keycode> {
+    let setup = conn.setup();
+    let min = setup.min_keycode;
+    let max = setup.max_keycode;
+    if max <= min {
+        return None;
+    }
+    let count = max - min + 1;
+    let reply = conn.get_keyboard_mapping(min, count).ok()?.reply().ok()?;
+    let per = reply.keysyms_per_keycode as usize;
+    if per == 0 {
+        return None;
+    }
+    for (i, chunk) in reply.keysyms.chunks(per).enumerate() {
+        if chunk.contains(&sym) {
+            return Some(min + i as Keycode);
+        }
+    }
+    None
+}
+
+/// Suppress key-repeat storms: one panel summon per 400ms.
+fn debounce_ok(last_panel: &AtomicU32, time: u32) -> bool {
+    let prev = last_panel.swap(time, Ordering::Relaxed);
+    time.saturating_sub(prev) > 400
+}
+
+fn spawn_panel() {
+    let _ = Command::new("ua-clipboard-panel")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 /// Transitional payload fetch: ask `xclip` for the targets list (secret

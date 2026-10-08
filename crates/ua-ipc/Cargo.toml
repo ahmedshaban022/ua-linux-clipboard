@@ -1,0 +1,10 @@
+[package]
+name = "ua-ipc"
+description = "Shared UA Clipboard IPC client: socket path resolution and JSON-line framing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ua-core = { path = "../ua-core" }
+serde_json = "1"

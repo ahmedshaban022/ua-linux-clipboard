@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/ua-core",
+    "crates/ua-ipc",
     "crates/ua-daemon",
     "crates/ua-gtk",
     "crates/ua-cli",

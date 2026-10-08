@@ -4,7 +4,7 @@
 //! consecutive or repeated copies of equal content never duplicate — the
 //! existing entry is bumped to the top with a refreshed timestamp.
 
-use crate::model::{kind_of, preview_for, Entry, RawCapture};
+use crate::model::{Entry, RawCapture};
 use crate::secrets::is_secret;
 use crate::store::Store;
 
@@ -38,7 +38,7 @@ pub fn admit(store: &mut dyn Store, capture: &RawCapture, policy: &HistoryPolicy
         return Admission::SkippedSecret;
     }
 
-    let kind = kind_of(capture);
+    let kind = capture.kind();
     if kind == crate::model::EntryKind::Image {
         let size = capture.image.as_ref().map(|v| v.len()).unwrap_or(0);
         if size > policy.max_image_bytes {
@@ -66,7 +66,7 @@ pub fn admit(store: &mut dyn Store, capture: &RawCapture, policy: &HistoryPolicy
         copied_at: capture.at_ms,
         pinned: false,
         pin_order: None,
-        preview: preview_for(capture),
+        preview: capture.preview(),
     };
 
     // Content-equal entry anywhere in history → bump it (Win11 behavior).
