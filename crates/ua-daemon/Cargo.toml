@@ -1,0 +1,19 @@
+[package]
+name = "ua-daemon"
+description = "UA Clipboard resident daemon: clipboard watching, SQLite history, IPC"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ua-clipboard-daemon"
+path = "src/main.rs"
+
+[dependencies]
+ua-core = { path = "../ua-core" }
+serde_json = "1"
+base64 = "0.22"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rusqlite = { version = "0.32", features = ["bundled"] }
+x11rb = { version = "0.13", features = ["xfixes"] }
