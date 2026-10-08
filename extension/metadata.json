@@ -1,0 +1,14 @@
+{
+  "uuid": "ua-clipboard@ua",
+  "name": "UA Clipboard",
+  "description": "Windows 11-style clipboard history — companion extension for the UA Clipboard daemon (watches the clipboard on GNOME Wayland and pushes entries to the daemon).",
+  "shell-version": [
+    "45",
+    "46",
+    "47",
+    "48"
+  ],
+  "version": 1,
+  "url": "https://github.com/ua/ua-linux-clipboard",
+  "settings-schema": "org.ua.clipboard"
+}
