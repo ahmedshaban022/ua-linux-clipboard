@@ -33,7 +33,7 @@ pub struct DaemonState {
     pub settings: Settings,
     /// Where settings persist (sqlite path on Linux; None in dev mode).
     pub db_path: Option<String>,
-    pub backend: &'static str,
+    pub backend: watchers::Backend,
     pub stats: Stats,
 }
 
@@ -78,7 +78,7 @@ fn main() {
         None,
     );
 
-    let backend = watchers::detect().label();
+    let backend = watchers::detect();
     let shortcut = loaded.shortcut.clone();
     let state = Arc::new(Mutex::new(DaemonState {
         store,
@@ -143,18 +143,12 @@ fn generate_thumbnail(state: &mut DaemonState, id: u64) -> Option<Vec<u8>> {
     Some(thumb)
 }
 
-#[cfg(target_os = "linux")]
 fn thumbnail_png(image: &[u8]) -> Option<Vec<u8>> {
     let img = image::load_from_memory(image).ok()?;
     let thumb = img.thumbnail(96, 96);
     let mut out = std::io::Cursor::new(Vec::new());
     thumb.write_to(&mut out, image::ImageFormat::Png).ok()?;
     Some(out.into_inner())
-}
-
-#[cfg(not(target_os = "linux"))]
-fn thumbnail_png(_image: &[u8]) -> Option<Vec<u8>> {
-    None
 }
 
 /// Spec §8: panics land in ~/.local/state/ua-clipboard/daemon.log, not
@@ -189,11 +183,7 @@ fn state_log_path() -> Option<String> {
 }
 
 pub fn socket_path() -> String {
-    std::env::var("UA_CLIPBOARD_SOCKET").unwrap_or_else(|_| {
-        let runtime = std::env::var("XDG_RUNTIME_DIR")
-            .unwrap_or_else(|_| std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()));
-        format!("{runtime}/ua-clipboard.sock")
-    })
+    ua_ipc::socket_path()
 }
 
 pub fn db_path_default() -> String {
@@ -212,25 +202,13 @@ pub fn handle_request(state: &mut DaemonState, req: Request) -> Response {
     match req {
         Request::Ping => Response::Pong,
         Request::List { query, offset } => {
-            let all = state.store.summaries();
-            let query = query.trim().to_string();
-            let matches_query = |s: &ua_core::ipc::EntrySummary| -> bool {
-                query.is_empty()
-                    || state
-                        .store
-                        .get(s.id)
-                        .map(|e| ua_core::search::matches(&e, &query))
-                        .unwrap_or(false)
-            };
-            let rows: Vec<_> = all
-                .into_iter()
-                .filter(matches_query)
-                .skip(offset as usize)
-                .collect();
+            // Store::search filters without materializing image blobs
+            // (SQL override) — the panel's <150ms priority depends on it.
+            let rows = state.store.search(query.trim(), offset);
             Response::Entries { entries: rows }
         }
         Request::Status => Response::Status {
-            backend: state.backend.to_string(),
+            backend: state.backend.label().to_string(),
             captures: state.stats.captures,
             secrets_skipped: state.stats.secrets_skipped,
             oversize_skipped: state.stats.oversize_skipped,
@@ -272,7 +250,7 @@ pub fn handle_request(state: &mut DaemonState, req: Request) -> Response {
             }
         }
         Request::Toggle => {
-            spawn_panel();
+            watchers::spawn_panel();
             Response::Ok
         }
         Request::Capture { capture } => {
@@ -302,17 +280,6 @@ fn capture_into_raw(capture: CapturePayload) -> RawCapture {
 fn decode_b64(b64: &str) -> Option<Vec<u8>> {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.decode(b64).ok()
-}
-
-/// Super+V ends here on X11 (daemon owns the XGrabKey) and via the
-/// shortcut command elsewhere: present the (single-instance) panel.
-fn spawn_panel() {
-    use std::process::{Command, Stdio};
-    let _ = Command::new("ua-clipboard-panel")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
 }
 
 fn persist_settings(state: &DaemonState) {

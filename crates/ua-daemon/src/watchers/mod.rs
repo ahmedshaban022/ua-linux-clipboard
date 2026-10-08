@@ -19,6 +19,17 @@ use ua_core::clock::Clock as _;
 use ua_core::ipc::CapturePayload;
 use ua_core::model::RawCapture;
 
+/// Present the (single-instance) panel. Shared by the daemon's Toggle
+/// handler and the X11 shortcut grab — one definition, one place.
+pub fn spawn_panel() {
+    use std::process::{Command, Stdio};
+    let _ = Command::new("ua-clipboard-panel")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     /// GNOME Wayland — Companion Extension pushes captures over IPC.

@@ -18,11 +18,12 @@
 
 ## 2. Architecture
 
-Five-crate Rust workspace; the daemon is the single source of truth, panel and CLI are thin clients.
+Six-crate Rust workspace; the daemon is the single source of truth, panel and CLI are thin clients.
 
 ```
 ua-core      pure domain: Entry model, history policy, pins, search, secret-filter, settings.
-ua-daemon    resident process: ClipboardWatcher impls, SQLite, DBus org.ua.Clipboard + signals.
+ua-ipc       the one shared IPC client (socket path + JSON-line framing).
+ua-daemon    resident process: ClipboardWatcher impls, SQLite, DBus org.ua.Clipboard + signals, Unix-socket transport.
 ua-gtk       the panel: gtk4-rs + libadwaita; daemon client; triggers paste pipeline.
 ua-cli       `ua-clipboard toggle|list|pin|delete|setup|doctor`.
 extension/   GJS GNOME Shell companion: watch, flyout anchoring, paste injection.

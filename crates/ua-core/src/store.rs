@@ -16,6 +16,17 @@ pub trait Store: Send {
     fn summaries(&self) -> Vec<EntrySummary> {
         self.list().iter().map(EntrySummary::from).collect()
     }
+    /// Query-filtered summaries (empty query = all), newest first, paged
+    /// by offset. Stores override this to filter WITHOUT materializing
+    /// image blobs; the default is correct-but-heavy (full entries).
+    fn search(&self, query: &str, offset: u32) -> Vec<EntrySummary> {
+        self.list()
+            .iter()
+            .filter(|e| crate::search::matches(e, query))
+            .skip(offset as usize)
+            .map(EntrySummary::from)
+            .collect()
+    }
     fn get(&self, id: u64) -> Option<Entry>;
     /// Insert a fully-formed entry, assigning its id. Returns the id.
     fn insert(&mut self, entry: Entry) -> u64;

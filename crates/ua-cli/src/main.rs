@@ -98,14 +98,16 @@ mod platform {
         format!("{home}/.local/state/ua-clipboard")
     }
 
+    /// GNOME settings-daemon schemas (custom keybinding registration).
+    const GSDA: &str = "org.gnome.settings-daemon.plugins.media-keys";
+    const GSDA_KB: &str = "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding";
+
     /// GNOME: register a custom keybinding via gsettings (ticket 02).
     pub fn register_gnome_shortcut(accel: &str, command: &str) -> Result<(), String> {
         let base = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/ua-clipboard/";
-        let sda = "org.gnome.settings-daemon.plugins.media-keys";
-        let kb = "org.gnome.settings-daemon.plugins.media-keys.custom-keybinding";
 
         let existing =
-            run("gsettings", &[sda, "get", "custom-keybindings"]).unwrap_or_else(|| "[]".into());
+            run("gsettings", &[GSDA, "get", "custom-keybindings"]).unwrap_or_else(|| "[]".into());
         if !existing.contains("ua-clipboard") {
             let trimmed = existing.trim_end_matches(']').trim();
             let merged = if existing.contains("@as") || trimmed == "[" {
@@ -113,22 +115,22 @@ mod platform {
             } else {
                 format!("{trimmed}, \"{base}\"]")
             };
-            run("gsettings", &["set", sda, "custom-keybindings", &merged])
+            run("gsettings", &["set", GSDA, "custom-keybindings", &merged])
                 .ok_or("gsettings set custom-keybindings failed")?;
         }
         run(
             "gsettings",
-            &["set", kb, &format!(":{base}"), "name", "UA Clipboard"],
+            &["set", GSDA_KB, &format!(":{base}"), "name", "UA Clipboard"],
         )
         .ok_or("gsettings set name failed")?;
         run(
             "gsettings",
-            &["set", kb, &format!(":{base}"), "command", command],
+            &["set", GSDA_KB, &format!(":{base}"), "command", command],
         )
         .ok_or("gsettings set command failed")?;
         run(
             "gsettings",
-            &["set", kb, &format!(":{base}"), "binding", accel],
+            &["set", GSDA_KB, &format!(":{base}"), "binding", accel],
         )
         .ok_or("gsettings set binding failed")?;
         Ok(())
@@ -136,9 +138,8 @@ mod platform {
 
     /// Unregister our GNOME keybinding entry if present.
     pub fn unregister_gnome_shortcut() -> Result<(), String> {
-        let sda = "org.gnome.settings-daemon.plugins.media-keys";
         let existing =
-            run("gsettings", &[sda, "get", "custom-keybindings"]).unwrap_or_else(|| "[]".into());
+            run("gsettings", &[GSDA, "get", "custom-keybindings"]).unwrap_or_else(|| "[]".into());
         if !existing.contains("ua-clipboard") {
             return Ok(());
         }
@@ -154,22 +155,15 @@ mod platform {
             let inner: Vec<String> = kept.iter().map(|p| format!("'{p}'")).collect();
             format!("[{}]", inner.join(", "))
         };
-        run("gsettings", &["set", sda, "custom-keybindings", &merged])
+        run("gsettings", &["set", GSDA, "custom-keybindings", &merged])
             .ok_or("gsettings set custom-keybindings failed")?;
         Ok(())
     }
 
     pub fn gnome_shortcut_registered() -> bool {
-        run(
-            "gsettings",
-            &[
-                "get",
-                "org.gnome.settings-daemon.plugins.media-keys",
-                "custom-keybindings",
-            ],
-        )
-        .map(|v| v.contains("ua-clipboard"))
-        .unwrap_or(false)
+        run("gsettings", &["get", GSDA, "custom-keybindings"])
+            .map(|v| v.contains("ua-clipboard"))
+            .unwrap_or(false)
     }
 
     pub fn write_autostart() -> Result<String, String> {
@@ -470,7 +464,7 @@ fn cmd_doctor() -> i32 {
         }) => {
             println!("• watcher backend: {backend}");
             println!(
-                "• stats: {captures} captures, {secrets_skipped} secrets skipped, {oversize_skipped} oversize images skipped"
+                "• stats (since daemon start): {captures} captures, {secrets_skipped} secrets skipped, {oversize_skipped} oversize images skipped"
             );
             if backend == "gnome-extension" {
                 println!("  (GNOME: captures appear only with the Companion Extension installed)");
@@ -566,6 +560,11 @@ fn cmd_uninstall(purge: bool) -> i32 {
     } else {
         println!("• history kept (use --purge to delete {})", state_dir());
     }
+
+    println!("• reminder: stop the running daemon (pkill -f ua-clipboard-daemon)");
+    println!(
+        "• reminder: remove ~/.local/share/gnome-shell/extensions/ua-clipboard@ua if installed"
+    );
 
     if bad == 0 {
         0

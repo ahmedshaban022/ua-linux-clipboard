@@ -64,10 +64,14 @@ export default class UAClipboardExtension extends Extension {
 
     _push(request) {
         try {
+            // Socket path mirrors ua-ipc's resolution (UA_CLIPBOARD_SOCKET
+            // is honored when set); GJS can't share the Rust crate, so the
+            // default stays in sync manually.
             const runtime = GLib.getenv('XDG_RUNTIME_DIR') || '/tmp';
+            const socket = GLib.getenv('UA_CLIPBOARD_SOCKET')
+                || `${runtime}/ua-clipboard.sock`;
             const client = new Gio.SocketClient();
-            const conn = client.connect(
-                Gio.UnixSocketAddress.new(`${runtime}/ua-clipboard.sock`), null);
+            const conn = client.connect(Gio.UnixSocketAddress.new(socket), null);
             const out = conn.get_output_stream();
             out.write_all(`${JSON.stringify(request)}\n`, null);
             out.flush(null);

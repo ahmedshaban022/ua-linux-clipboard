@@ -13,6 +13,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 
+use super::spawn_panel;
 use ua_core::accel::Accel;
 use ua_core::clock::{Clock as _, SystemClock};
 use ua_core::model::RawCapture;
@@ -59,14 +60,22 @@ fn run(tx: &Sender<RawCapture>, shortcut: &str) -> Result<(), Box<dyn std::error
         | x11rb::protocol::xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE;
     conn.xfixes_select_selection_input(win, clipboard, mask)?;
 
-    // Global shortcut: grab the configured accel on the root window.
-    grab_shortcut(&conn, screen.root, shortcut)?;
+    // Global shortcut: resolve the configured accel to (mods, keycode)
+    // ONCE — the same pair drives both the XGrabKey and the KeyPress match,
+    // so the grabbed key and the handled key can never diverge.
+    let shortcut_grab = resolve_shortcut(&conn, shortcut);
+    match shortcut_grab {
+        Some((base, keycode)) => grab_key_combo(&conn, screen.root, base, keycode)?,
+        None => eprintln!(
+            "[daemon] x11: shortcut '{shortcut}' not grabbable (unmapped key?); global key disabled"
+        ),
+    }
 
     conn.flush()?;
 
     println!("[daemon] x11: watching CLIPBOARD via XFixes; shortcut grabbed");
     let last_panel = AtomicU32::new(0);
-    let grabbed = shortcut_key(shortcut).map(|(_, _, keycode)| keycode);
+    let pressed_key = shortcut_grab.map(|(_, keycode)| keycode);
     loop {
         let event = conn.wait_for_event()?;
         match event {
@@ -81,7 +90,7 @@ fn run(tx: &Sender<RawCapture>, shortcut: &str) -> Result<(), Box<dyn std::error
                 }
             }
             Event::KeyPress(press)
-                if grabbed == Some(press.detail) && debounce_ok(&last_panel, press.time) =>
+                if pressed_key == Some(press.detail) && debounce_ok(&last_panel, press.time) =>
             {
                 spawn_panel();
             }
@@ -90,8 +99,8 @@ fn run(tx: &Sender<RawCapture>, shortcut: &str) -> Result<(), Box<dyn std::error
     }
 }
 
-/// Parse the settings accelerator into (modifier bits, keysym, keycode).
-fn shortcut_key(shortcut: &str) -> Option<(ModMask, u32, Keycode)> {
+/// Parse the settings accelerator into (modifier bits, keysym).
+fn shortcut_key(shortcut: &str) -> Option<(ModMask, u32)> {
     let accel = Accel::parse(shortcut).or_else(|| Accel::parse("<Super>v"))?;
     let mut mods = ModMask::default();
     if accel.ctrl {
@@ -107,7 +116,7 @@ fn shortcut_key(shortcut: &str) -> Option<(ModMask, u32, Keycode)> {
         mods |= ModMask::M4;
     }
     let sym = keysym(&accel.key)?;
-    Some((mods, sym, 0))
+    Some((mods, sym))
 }
 
 fn keysym(key: &str) -> Option<u32> {
@@ -129,26 +138,23 @@ fn keysym(key: &str) -> Option<u32> {
     None
 }
 
-/// Grab `shortcut` on the root window, once per NumLock/CapsLock/ScrollLock
-/// combination so the grab survives modifier state (the classic X11 gotcha,
-/// ticket 02).
-fn grab_shortcut(
+/// Resolve the shortcut to (modifier bits, keycode) on this keyboard, or
+/// None if the key isn't mapped (grab disabled, logged by the caller).
+fn resolve_shortcut(conn: &RustConnection, shortcut: &str) -> Option<(ModMask, Keycode)> {
+    let (mods, sym) = shortcut_key(shortcut)?;
+    let keycode = keycode_for_keysym(conn, sym)?;
+    Some((mods, keycode))
+}
+
+/// Grab `keycode` with `base` modifiers on the root window, once per
+/// NumLock/CapsLock/ScrollLock combination so the grab survives modifier
+/// state (the classic X11 gotcha, ticket 02).
+fn grab_key_combo(
     conn: &RustConnection,
     root: u32,
-    shortcut: &str,
+    base: ModMask,
+    keycode: Keycode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (base, sym, _) = match shortcut_key(shortcut) {
-        Some(triple) => triple,
-        None => {
-            eprintln!("[daemon] x11: shortcut '{shortcut}' not grabbable; global key disabled");
-            return Ok(());
-        }
-    };
-    let Some(keycode) = keycode_for_keysym(conn, sym) else {
-        eprintln!("[daemon] x11: no keycode for keysym {sym:#x}; global key disabled");
-        return Ok(());
-    };
-
     let numlock = ModMask::M2;
     let capslock = ModMask::LOCK;
     let scrolllock = ModMask::M5;
@@ -200,14 +206,6 @@ fn keycode_for_keysym(conn: &RustConnection, sym: u32) -> Option<Keycode> {
 fn debounce_ok(last_panel: &AtomicU32, time: u32) -> bool {
     let prev = last_panel.swap(time, Ordering::Relaxed);
     time.saturating_sub(prev) > 400
-}
-
-fn spawn_panel() {
-    let _ = Command::new("ua-clipboard-panel")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
 }
 
 /// Transitional payload fetch: ask `xclip` for the targets list (secret

@@ -126,12 +126,18 @@ impl Store for SqliteStore {
         let sql = format!("SELECT * FROM entries {LIST_ORDER}");
         let mut stmt = match self.conn.prepare(&sql) {
             Ok(s) => s,
-            Err(_) => return vec![],
+            Err(e) => {
+                eprintln!("[daemon] list prepare failed: {e}");
+                return vec![];
+            }
         };
         let rows = stmt.query_map([], SqliteStore::row_to_entry);
         match rows {
             Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-            Err(_) => vec![],
+            Err(e) => {
+                eprintln!("[daemon] list query failed: {e}");
+                vec![]
+            }
         }
     }
 
@@ -146,13 +152,72 @@ impl Store for SqliteStore {
         );
         let mut stmt = match self.conn.prepare(&sql) {
             Ok(s) => s,
-            Err(_) => return vec![],
+            Err(e) => {
+                eprintln!("[daemon] summaries prepare failed: {e}");
+                return vec![];
+            }
         };
         let rows = stmt.query_map([], SqliteStore::row_to_summary);
         match rows {
             Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-            Err(_) => vec![],
+            Err(e) => {
+                eprintln!("[daemon] summaries query failed: {e}");
+                vec![]
+            }
         }
+    }
+
+    /// Query-filtered listing without blob materialization: text/uris ride
+    /// along for `ua_core::search::matches` (its haystack is preview+text+
+    /// uris), image sizes come from SQL LENGTH — no payload ever crosses.
+    fn search(&self, query: &str, offset: u32) -> Vec<EntrySummary> {
+        let q = query.trim();
+        if q.is_empty() {
+            return self.summaries().into_iter().skip(offset as usize).collect();
+        }
+        let sql = format!(
+            "SELECT id, kind, text, uris_json, preview, pinned, copied_at, source_app,
+                    COALESCE(LENGTH(text),0) + COALESCE(LENGTH(html),0)
+                    + COALESCE(LENGTH(image_blob),0) AS size_bytes
+             FROM entries {LIST_ORDER}"
+        );
+        let Ok(mut stmt) = self.conn.prepare(&sql) else {
+            eprintln!("[daemon] search prepare failed");
+            return vec![];
+        };
+        let Ok(rows) = stmt.query_map([], |row| {
+            let kind: String = row.get("kind")?;
+            let uris_json: Option<String> = row.get("uris_json")?;
+            Ok((
+                Entry {
+                    id: row.get("id")?,
+                    kind: EntryKind::parse(&kind).unwrap_or(EntryKind::Text),
+                    text: row.get("text")?,
+                    html: None,
+                    image: None,
+                    thumb: None,
+                    uris: uris_json.and_then(|j| serde_json::from_str(&j).ok()),
+                    source_app: row.get("source_app")?,
+                    copied_at: row.get("copied_at")?,
+                    pinned: row.get::<_, i64>("pinned")? != 0,
+                    pin_order: None,
+                    preview: row.get("preview")?,
+                },
+                row.get::<_, i64>("size_bytes")? as u64,
+            ))
+        }) else {
+            eprintln!("[daemon] search query failed");
+            return vec![];
+        };
+        rows.filter_map(|r| r.ok())
+            .filter(|(entry, _)| ua_core::search::matches(entry, q))
+            .skip(offset as usize)
+            .map(|(entry, size)| {
+                let mut s = EntrySummary::from(&entry);
+                s.size_bytes = size;
+                s
+            })
+            .collect()
     }
 
     fn get(&self, id: u64) -> Option<Entry> {
