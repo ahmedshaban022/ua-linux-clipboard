@@ -25,7 +25,7 @@ sudo apt install build-essential pkg-config libxcb1-dev libgtk-4-dev libadwaita-
 # Fedora: sudo dnf install gcc pkgconf-pkg-config libxcb-devel gtk4-devel libadwaita-devel
 # Arch:   sudo pacman -S base-devel libxcb gtk4 libadwaita
 
-git clone <this-repo> && cd ua-linux-clipboard
+git clone https://github.com/ahmedshaban022/ua-linux-clipboard.git && cd ua-linux-clipboard
 ./install.sh          # builds release, installs to ~/.local/bin, runs setup
 ```
 
@@ -36,7 +36,7 @@ Make sure `~/.local/bin` is on your `PATH` (the script warns if not).
 Any Linux machine with Docker gets the same result — no compiler, no GTK headers installed on the host:
 
 ```sh
-git clone <this-repo> && cd ua-linux-clipboard
+git clone https://github.com/ahmedshaban022/ua-linux-clipboard.git && cd ua-linux-clipboard
 docker run --rm -v "$PWD:/app" -w /app rust:slim-trixie sh -c '
   apt-get update -qq && apt-get install -y -qq build-essential pkg-config \
     libxcb1-dev libgtk-4-dev libadwaita-1-dev &&
